@@ -78,50 +78,6 @@ public class RequestRetryPolicyTest {
         assertEquals(200, response.getStatusCode());
     }
 
-    @Test
-    public void requestRetryPolicyRetriesTimeoutSync() {
-        HttpPipeline pipeline = new HttpPipelineBuilder()
-            .policies(new RetryPolicy())
-            .httpClient(new NoOpHttpClient() {
-                int count = -1;
-                long previousAttemptMadeAt = -1;
-                HttpResponse response;
-                private void beforeSendingRequest(HttpRequest request) {
-                    if (count > 0) {
-                        Assertions.assertTrue(System.currentTimeMillis() >= previousAttemptMadeAt + retryTestOptions.getTryTimeoutDuration().toMillis());
-                    }
-                    Assertions.assertTrue(count++ < retryTestOptions.getMaxTries());
-                    previousAttemptMadeAt = System.currentTimeMillis();
-                    if (count < 3) {
-                        response = new MockHttpResponse(request, 503);
-                    } else if (count == 3) {
-                        response = new MockHttpResponse(request, 200);
-                    } else {
-                        // Too many requests have been made.
-                        response = new MockHttpResponse(request, 400);
-                    }
-                }
-
-                @Override
-                public HttpResponse sendSync(HttpRequest request, Context context) {
-                    beforeSendingRequest(request);
-                    return response;
-                }
-
-                @Override
-                public Mono<HttpResponse> send(HttpRequest request) {
-                    beforeSendingRequest(request);
-                    return Mono.just(response);
-                }
-            })
-            .policies(new RequestRetryPolicy(retryTestOptions))
-            .build();
-
-        HttpResponse response = sendRequestSync(pipeline);
-
-        assertEquals(200, response.getStatusCode());
-    }
-
     @SyncAsyncTest
     public void retryConsumesBody() {
         AtomicInteger closeCalls = new AtomicInteger();

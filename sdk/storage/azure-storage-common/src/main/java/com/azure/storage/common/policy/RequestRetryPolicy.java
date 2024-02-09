@@ -255,17 +255,6 @@ public final class RequestRetryPolicy implements HttpPipelinePolicy {
              */
             HttpResponse response = next.clone().processSync();
 
-            // Default try timeout is Integer.MAX_VALUE seconds, if it's that don't set a timeout as that's about 68 years
-            // and would likely never complete.
-            // TODO (alzimmer): Think about not adding this if it's over a certain length, like 1 year.
-            if (this.requestRetryOptions.getTryTimeoutDuration().getSeconds() != Integer.MAX_VALUE) {
-                try {
-                    Thread.sleep(this.requestRetryOptions.getTryTimeoutDuration().toMillis());
-                } catch (InterruptedException ie) {
-                    throw LOGGER.logExceptionAsError(new RuntimeException(ie));
-                }
-            }
-
             boolean newConsiderSecondary = considerSecondary;
             int statusCode = response.getStatusCode();
             boolean retry = shouldStatusCodeBeRetried(statusCode, tryingPrimary);
