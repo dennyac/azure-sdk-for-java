@@ -3,6 +3,7 @@
 ### 4.49.0-beta.1 (Unreleased)
 
 #### Features Added
+* Added new Spark config `spark.cosmos.write.bulk.maxPendingOperations.adaptive` (default `false`). When `true`, the bulk-writer semaphore that gates `maxPendingOperations` becomes adaptive: a two-phase TCP-Reno-style controller (slow-start until the first backend 429, then additive-increase / multiplicative-decrease) — same algorithm shape as Netflix's `concurrency-limits.AIMDLimit` and Envoy's adaptive concurrency filter. Starts at 8 permits, doubles per 20 successes during slow-start, halves on backend 429 (with a 100ms cooldown) once the local semaphore is saturated, additively probes thereafter. Client-side throughput-control rejections (subStatus 10003 / 10005) are intentionally ignored because the request never left the SDK. The controller is RU-agnostic — the same constants converge correctly across containers from 1K RU to 1M RU. Avoids the cold-start 429 storm that the default static cap of 10688 produces when throughput control is enabled with multiple clients, without requiring per-stamp tuning. `spark.cosmos.write.bulk.maxPendingOperations` continues to be honoured as the upper bound (now primarily a memory safety bound rather than a rate cap, since the adaptive controller plus the throughput-control bucket govern rate).
 
 #### Breaking Changes
 

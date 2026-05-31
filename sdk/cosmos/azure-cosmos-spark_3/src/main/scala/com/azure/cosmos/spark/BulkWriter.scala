@@ -5,7 +5,7 @@ package com.azure.cosmos.spark
 // scalastyle:off underscore.import
 import com.azure.cosmos.implementation.apachecommons.lang.StringUtils
 import com.azure.cosmos.implementation.batch.{BatchRequestResponseConstants, BulkExecutorDiagnosticsTracker, ItemBulkOperation}
-import com.azure.cosmos.implementation.{CosmosDaemonThreadFactory, ImplementationBridgeHelpers, UUIDs}
+import com.azure.cosmos.implementation.{CosmosDaemonThreadFactory, HttpConstants, ImplementationBridgeHelpers, UUIDs}
 import com.azure.cosmos.models._
 import com.azure.cosmos.spark.BulkWriter.{BulkOperationFailedException, bulkWriterInputBoundedElastic, bulkWriterRequestsBoundedElastic, bulkWriterResponsesBoundedElastic, getThreadInfo, readManyBoundedElastic}
 import com.azure.cosmos.spark.diagnostics.DefaultDiagnostics
@@ -70,6 +70,22 @@ private class BulkWriter
   private val maxPendingOperations = writeConfig.bulkMaxPendingOperations
     .getOrElse(DefaultMaxPendingOperationPerCore)
 
+  // When the writer is configured with `spark.cosmos.write.bulk.maxPendingOperations.adaptive=true`
+  // we instantiate an AdaptiveSemaphore (TCP-style AIMD) that starts with a small initial
+  // permit count and grows up to `maxPendingOperations` on success / halves on backend 429.
+  // Otherwise we keep the historical behaviour: a fixed-size Semaphore that admits
+  // `maxPendingOperations` immediately, which produces the cold-start 429 storm when
+  // throughput control is enabled with multiple clients (see AdaptiveSemaphore docstring).
+  private val maxPendingOperationsAdaptive = writeConfig.bulkMaxPendingOperationsAdaptive
+
+  // Initial / floor constants chosen so the cold-start burst is small regardless of
+  // cluster fan-out. The growth-rate constants live on `AdaptiveSemaphore` itself
+  // (see AdaptiveSemaphore.scala) and are validated in the simulator at
+  // https://github.com/dennyac/cosmos-bulk-writer-sim across 1K / 10K / 100K / 1M
+  // RU containers — the same values converge correctly across the full range.
+  private val adaptiveInitialPermits = 8
+  private val adaptivePermitFloor = 2
+
   private val bulkExecutionConfigs = writeConfig.bulkExecutionConfigs.get.asInstanceOf[CosmosWriteBulkExecutionConfigs]
   private val maxConcurrentPartitions = bulkExecutionConfigs.maxConcurrentCosmosPartitions match {
     // using the provided maximum of concurrent partitions per Spark partition on the input data
@@ -81,6 +97,7 @@ private class BulkWriter
   }
   log.logInfo(
     s"BulkWriter instantiated (Host CPU count: $cpuCount, maxPendingOperations: $maxPendingOperations, " +
+  s"maxPendingOperationsAdaptive: $maxPendingOperationsAdaptive, " +
   s"maxConcurrentPartitions: $maxConcurrentPartitions ...")
 
   // Artificial operation used to signale to the bufferUntil operator that
@@ -108,7 +125,14 @@ private class BulkWriter
 
   private val activeBulkWriteOperations =java.util.concurrent.ConcurrentHashMap.newKeySet[CosmosItemOperation]().asScala
   private val activeReadManyOperations = java.util.concurrent.ConcurrentHashMap.newKeySet[ReadManyOperation]().asScala
-  private val semaphore = new Semaphore(maxPendingOperations)
+  private val semaphore: Semaphore = if (maxPendingOperationsAdaptive) {
+    new AdaptiveSemaphore(
+      initialPermits = math.min(adaptiveInitialPermits, maxPendingOperations),
+      floor = math.min(adaptivePermitFloor, maxPendingOperations),
+      ceiling = maxPendingOperations)
+  } else {
+    new Semaphore(maxPendingOperations)
+  }
 
   private val totalScheduledMetrics = new AtomicLong(0)
   private val totalSuccessfulIngestionMetrics = new AtomicLong(0)
@@ -599,6 +623,7 @@ private class BulkWriter
             if (resp.getException != null) {
               Option(resp.getException) match {
                 case Some(cosmosException: CosmosException) =>
+                  notifyAdaptiveSemaphore(cosmosException.getStatusCode, cosmosException.getSubStatusCode)
                   handleNonSuccessfulStatusCode(
                     context, itemOperation, itemResponse, isGettingRetried, Some(cosmosException))
                 case _ =>
@@ -611,11 +636,15 @@ private class BulkWriter
                   cancelWork()
               }
             } else if (Option(itemResponse).isEmpty || !itemResponse.isSuccessStatusCode) {
+              if (itemResponse != null) {
+                notifyAdaptiveSemaphore(itemResponse.getStatusCode, itemResponse.getSubStatusCode)
+              }
               handleNonSuccessfulStatusCode(context, itemOperation, itemResponse, isGettingRetried, None)
             } else {
               // no error case
               outputMetricsPublisher.trackWriteOperation(1, None)
               totalSuccessfulIngestionMetrics.getAndIncrement()
+              notifyAdaptiveSemaphoreSuccess()
             }
           }
         }
@@ -913,6 +942,38 @@ private class BulkWriter
     }
   }
 
+  /** Notify the AdaptiveSemaphore (if enabled) about a successful per-op response. No-op
+    * for the static [[Semaphore]] code path. */
+  private[this] def notifyAdaptiveSemaphoreSuccess(): Unit = {
+    semaphore match {
+      case adaptive: AdaptiveSemaphore => adaptive.onSuccess()
+      case _ => ()
+    }
+  }
+
+  /** Notify the AdaptiveSemaphore (if enabled) about a non-success per-op response. The
+    * classification matters: actual backend 429s (`HttpConstants.StatusCodes.TOO_MANY_REQUESTS`)
+    * are the only signal that should shrink the cap. Throughput-control rate-limits
+    * (subStatus `THROUGHPUT_CONTROL_REQUEST_RATE_TOO_LARGE` / `THROUGHPUT_CONTROL_BULK_REQUEST_RATE_TOO_LARGE`)
+    * are client-side bookkeeping and explicitly NOT a backend pressure signal — the request
+    * never left the SDK. All other non-success codes (Conflict, NotFound, etc.) are
+    * treated as neither: they neither indicate pressure nor success and shouldn't grow
+    * the cap. No-op for the static [[Semaphore]] code path. */
+  private[this] def notifyAdaptiveSemaphore(statusCode: Int, subStatusCode: Int): Unit = {
+    semaphore match {
+      case adaptive: AdaptiveSemaphore =>
+        if (statusCode == HttpConstants.StatusCodes.TOO_MANY_REQUESTS) {
+          if (subStatusCode == HttpConstants.SubStatusCodes.THROUGHPUT_CONTROL_REQUEST_RATE_TOO_LARGE
+              || subStatusCode == HttpConstants.SubStatusCodes.THROUGHPUT_CONTROL_BULK_REQUEST_RATE_TOO_LARGE) {
+            adaptive.onClientThrottle()
+          } else {
+            adaptive.onServerThrottle()
+          }
+        }
+      case _ => ()
+    }
+  }
+
   private[this] def getActiveOperationsLog(
                                               activeOperationsSnapshot: mutable.Set[CosmosItemOperation],
                                               activeReadManyOperationsSnapshot: mutable.Set[ReadManyOperation]): String = {
@@ -1197,7 +1258,13 @@ private class BulkWriter
 
           assume(activeBulkWriteOperations.isEmpty)
           assume(activeReadManyOperations.isEmpty)
-          assume(semaphore.availablePermits() >= maxPendingOperations)
+          // For AdaptiveSemaphore, the cap may have shrunk below maxPendingOperations after
+          // a server 429, so we compare against currentCap rather than the static ceiling.
+          val expectedAvailablePermits = semaphore match {
+            case adaptive: AdaptiveSemaphore => adaptive.currentCap
+            case _ => maxPendingOperations
+          }
+          assume(semaphore.availablePermits() >= expectedAvailablePermits)
 
           if (totalScheduledMetrics.get() != totalSuccessfulIngestionMetrics.get) {
             log.logWarning(s"flushAndClose completed with no error but inconsistent total success and " +

@@ -120,6 +120,7 @@ private[spark] object CosmosConfigNames {
   val WriteBulkEnabled = "spark.cosmos.write.bulk.enabled"
   val WriteBulkTransactional = "spark.cosmos.write.bulk.transactional"
   val WriteBulkMaxPendingOperations = "spark.cosmos.write.bulk.maxPendingOperations"
+  val WriteBulkMaxPendingOperationsAdaptive = "spark.cosmos.write.bulk.maxPendingOperations.adaptive"
   val WriteBulkMaxBatchSize = "spark.cosmos.write.bulk.maxBatchSize"
   val WriteBulkMinTargetBatchSize = "spark.cosmos.write.bulk.minTargetBatchSize"
   val WriteBulkMaxConcurrentPartitions = "spark.cosmos.write.bulk.maxConcurrentCosmosPartitions"
@@ -261,6 +262,7 @@ private[spark] object CosmosConfigNames {
     WriteBulkEnabled,
     WriteBulkTransactional,
     WriteBulkMaxPendingOperations,
+    WriteBulkMaxPendingOperationsAdaptive,
     WriteBulkMaxConcurrentPartitions,
     WriteBulkPayloadSizeInBytes,
     WriteBulkInitialBatchSize,
@@ -1589,6 +1591,7 @@ private case class CosmosWriteConfig(itemWriteStrategy: ItemWriteStrategy,
                                      bulkTransactional: Boolean,
                                      bulkExecutionConfigs: Option[CosmosWriteBulkExecutionConfigsBase] = None,
                                      bulkMaxPendingOperations: Option[Int] = None,
+                                     bulkMaxPendingOperationsAdaptive: Boolean = false,
                                      pointMaxConcurrency: Option[Int] = None,
                                      patchConfigs: Option[CosmosPatchConfigs] = None,
                                      throughputControlConfig: Option[CosmosThroughputControlConfig] = None,
@@ -1671,7 +1674,24 @@ private object CosmosWriteConfig {
     mandatory = false,
     parseFromStringFunction = bulkMaxConcurrencyAsString => bulkMaxConcurrencyAsString.toInt,
     helpMessage = s"Cosmos DB Item Write Max Pending Operations." +
-      s" If not specified it will be determined based on the Spark executor VM Size")
+      s" If not specified it will be determined based on the Spark executor VM Size." +
+      s" When `${CosmosConfigNames.WriteBulkMaxPendingOperationsAdaptive}` is true this value is" +
+      s" treated as the upper bound (ceiling) rather than a fixed cap, and the controller starts" +
+      s" small and grows on success.")
+
+  private val bulkMaxPendingOperationsAdaptive = CosmosConfigEntry[Boolean](
+    key = CosmosConfigNames.WriteBulkMaxPendingOperationsAdaptive,
+    defaultValue = Option.apply(false),
+    mandatory = false,
+    parseFromStringFunction = s => s.toBoolean,
+    helpMessage = "Enable TCP-style additive-increase / multiplicative-decrease adaptive sizing of" +
+      " the bulk-writer pending-operations semaphore. When true, the semaphore starts at a small" +
+      " value (8 permits), grows by +1 per consecutive successful response, and halves (with a" +
+      " 100ms cooldown) on every backend 429 that arrives while the semaphore is saturated." +
+      " Use this to avoid the cold-start 429 storm produced by the default static cap when" +
+      " throughput control is enabled with multiple clients. The static cap" +
+      s" `${CosmosConfigNames.WriteBulkMaxPendingOperations}` continues to be honoured as the" +
+      " upper bound. Default false.")
 
   private val bulkMaxConcurrentPartitions = CosmosConfigEntry[Int](
     key = CosmosConfigNames.WriteBulkMaxConcurrentPartitions,
@@ -1982,6 +2002,7 @@ private object CosmosWriteConfig {
       bulkTransactional = bulkTransactionalOpt.get,
       bulkExecutionConfigs = bulkExecutionConfigsOpt,
       bulkMaxPendingOperations = CosmosConfigEntry.parse(cfg, bulkMaxPendingOperations),
+      bulkMaxPendingOperationsAdaptive = CosmosConfigEntry.parse(cfg, bulkMaxPendingOperationsAdaptive).getOrElse(false),
       pointMaxConcurrency = CosmosConfigEntry.parse(cfg, pointWriteConcurrency),
       patchConfigs = patchConfigsOpt,
       throughputControlConfig = throughputControlConfigOpt,
